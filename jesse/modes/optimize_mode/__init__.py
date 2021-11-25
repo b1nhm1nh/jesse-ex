@@ -21,8 +21,6 @@ from jesse.services import metrics as stats
 from jesse.services.validators import validate_routes
 from jesse.store import store
 
-os.environ['NUMEXPR_MAX_THREADS'] = str(cpu_count())
-
 
 class Optimizer():
     def __init__(self, training_candles, optimal_total: int, cpu_cores: int, iterations: int) -> None:
@@ -142,6 +140,7 @@ class Optimizer():
 
         search_space = self.get_search_space()
 
+        ## todo make GA settings editable by user
         sampler = NSGAIISampler(population_size=300, mutation_prob=0.0333, crossover_prob=0.6, swapping_prob=0.05)
 
         local_dir = "./storage/genetics/ray"
