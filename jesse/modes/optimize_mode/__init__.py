@@ -120,7 +120,7 @@ class Optimizer():
             if st_hp['type'] is int:
                 if 'step' not in st_hp:
                     st_hp['step'] = 1
-                config[st_hp['name']] = tune.choice(range(st_hp['min'], st_hp['max'] + st_hp['step'], st_hp['step']))
+                config[st_hp['name']] = tune.choice(list(range(st_hp['min'], st_hp['max'] + st_hp['step'], st_hp['step'])))
             elif st_hp['type'] is float:
                 if 'step' not in st_hp:
                     st_hp['step'] = 0.1
