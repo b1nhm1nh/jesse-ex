@@ -310,14 +310,13 @@ def backtest(start_date: str, finish_date: str, debug: bool, csv: bool, json: bo
 @click.argument('start_date', required=True, type=str)
 @click.argument('finish_date', required=True, type=str)
 @click.argument('optimal_total', required=True, type=int)
-@click.option(
-    '--cpu', default=0, show_default=True,
+@click.argument('iterations', required=True, type=int)
+@click.option('--cpu', default=0, show_default=True,
     help='The number of CPU cores that Jesse is allowed to use. If set to 0, it will use as many as is available on your machine.')
-@click.option(
-    '--debug/--no-debug', default=False,
+@click.option('--debug/--no-debug', default=False,
     help='Displays detailed logs about the genetics algorithm. Use it if you are interested int he genetics algorithm.'
 )
-def optimize(start_date: str, finish_date: str, optimal_total: int, cpu: int, debug: bool) -> None:
+def optimize(start_date: str, finish_date: str, optimal_total: int, iterations:int, cpu: int, debug: bool) -> None:
     """
     tunes the hyper-parameters of your strategy
     """
@@ -330,9 +329,9 @@ def optimize(start_date: str, finish_date: str, optimal_total: int, cpu: int, de
     # debug flag
     config['app']['debug_mode'] = debug
 
-    from jesse.modes.optimize_mode import optimize_mode
+    from jesse.modes.optimize_mode import optimize_mode_ray
 
-    optimize_mode(start_date, finish_date, optimal_total, cpu)
+    optimize_mode_ray(start_date, finish_date, optimal_total, cpu, iterations)
 
 
 @cli.command()

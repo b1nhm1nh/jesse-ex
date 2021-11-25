@@ -1,28 +1,30 @@
 import os
+import traceback
 from math import log10
 from multiprocessing import cpu_count
-from typing import Dict, Any, Tuple, Union
 
-import arrow
 import click
-from numpy import ndarray
+from ray import tune
+import ray
+import numpy as np
+from ray.tune.suggest.optuna import OptunaSearch
+from optuna.samplers import NSGAIISampler
 
 import jesse.helpers as jh
+import jesse.services.logger as logger
 import jesse.services.required_candles as required_candles
 from jesse import exceptions
 from jesse.config import config
-from jesse.modes.backtest_mode import load_candles, simulator
+from jesse.modes.backtest_mode import simulator
 from jesse.routes import router
 from jesse.services import metrics as stats
 from jesse.services.validators import validate_routes
 from jesse.store import store
-from .Genetics import Genetics
 
 os.environ['NUMEXPR_MAX_THREADS'] = str(cpu_count())
 
-
-class Optimizer(Genetics):
-    def __init__(self, training_candles: ndarray, testing_candles: ndarray, optimal_total: int, cpu_cores: int, start_date: str, finish_date: str) -> None:
+class Optimizer():
+    def __init__(self, training_candles, optimal_total: int, cpu_cores: int, iterations: int) -> None:
         if len(router.routes) != 1:
             raise NotImplementedError('optimize_mode mode only supports one route at the moment')
 
@@ -33,25 +35,11 @@ class Optimizer(Genetics):
         self.timeframe = router.routes[0].timeframe
         StrategyClass = jh.get_strategy_class(self.strategy_name)
         self.strategy_hp = StrategyClass.hyperparameters(None)
-        solution_len = len(self.strategy_hp)
+        self.solution_len = len(self.strategy_hp)
+        self.iterations = iterations
 
-        if solution_len == 0:
+        if self.solution_len == 0:
             raise exceptions.InvalidStrategy('Targeted strategy does not implement a valid hyperparameters() method.')
-
-        super().__init__(
-            iterations=2000 * solution_len,
-            population_size=solution_len * 100,
-            solution_len=solution_len,
-            options={
-                'strategy_name': self.strategy_name,
-                'exchange': self.exchange,
-                'symbol': self.symbol,
-                'timeframe': self.timeframe,
-                'strategy_hp': self.strategy_hp,
-                'start_date': start_date,
-                'finish_date': finish_date,
-            }
-        )
 
         if cpu_cores > cpu_count():
             raise ValueError(f'Entered cpu cores number is more than available on this machine which is {cpu_count()}')
@@ -61,50 +49,37 @@ class Optimizer(Genetics):
             self.cpu_cores = cpu_cores
 
         self.training_candles = training_candles
-        self.testing_candles = testing_candles
 
         key = jh.key(self.exchange, self.symbol)
         training_candles_start_date = jh.timestamp_to_time(self.training_candles[key]['candles'][0][0]).split('T')[0]
         training_candles_finish_date = jh.timestamp_to_time(self.training_candles[key]['candles'][-1][0]).split('T')[0]
-        testing_candles_start_date = jh.timestamp_to_time(self.testing_candles[key]['candles'][0][0]).split('T')[0]
-        testing_candles_finish_date = jh.timestamp_to_time(self.testing_candles[key]['candles'][-1][0]).split('T')[0]
 
         self.training_initial_candles = []
-        self.testing_initial_candles = []
 
         for c in config['app']['considering_candles']:
             self.training_initial_candles.append(
                 required_candles.load_required_candles(c[0], c[1], training_candles_start_date,
                                                        training_candles_finish_date))
-            self.testing_initial_candles.append(
-                required_candles.load_required_candles(c[0], c[1], testing_candles_start_date,
-                                                       testing_candles_finish_date))
 
-    def fitness(self, dna: str) -> tuple:
-        hp = jh.dna_to_hp(self.strategy_hp, dna)
+        self.study_name = f'{self.strategy_name}-{self.exchange}-{self.symbol}-{self.timeframe}'
 
-        # init candle store
-        store.candles.init_storage(5000)
-        # inject required TRAINING candles to the candle store
 
-        for num, c in enumerate(config['app']['considering_candles']):
-            required_candles.inject_required_candles_to_store(
-                self.training_initial_candles[num],
-                c[0],
-                c[1]
-            )
+    def objective_function(self, search_space):
+        score = np.nan
+        try:
+            # init candle store
+            store.candles.init_storage(5000)
+            # inject required TRAINING candles to the candle store
 
-        # run backtest simulation
-        simulator(self.training_candles, hp)
+            for num, c in enumerate(config['app']['considering_candles']):
+                required_candles.inject_required_candles_to_store(
+                    self.training_initial_candles[num],
+                    c[0],
+                    c[1]
+                )
+            # run backtest simulation
+            simulator(self.training_candles, search_space)
 
-        training_data = {'win_rate': None, 'total': None,
-                        'net_profit_percentage': None}
-        testing_data = {'win_rate': None, 'total': None,
-                       'net_profit_percentage': None}
-
-        # TODO: some of these have to be dynamic based on how many days it's trading for like for example "total"
-        # I'm guessing we should accept "optimal" total from command line
-        if store.completed_trades.count > 5:
             training_data = stats.trades(store.completed_trades.trades, store.app.daily_balance)
             total_effect_rate = log10(training_data['total']) / log10(self.optimal_total)
             total_effect_rate = min(total_effect_rate, 1)
@@ -134,90 +109,78 @@ class Optimizer(Genetics):
                 raise ValueError(
                     f'The entered ratio configuration `{ratio_config}` for the optimization is unknown. Choose between sharpe, calmar, sortino, serenity, smart shapre, smart sortino and omega.')
 
-            if ratio < 0:
-                score = 0.0001
-                # reset store
-                store.reset()
-                return score, training_data, testing_data
+            if ratio > 0:
+                score = total_effect_rate * ratio_normalized
 
-            score = total_effect_rate * ratio_normalized
-
-            # perform backtest with testing data. this is using data
-            # model hasn't trained for. if it works well, there is
-            # high change it will do good with future data too.
-            store.reset()
-            store.candles.init_storage(5000)
-            # inject required TESTING candles to the candle store
-
-            for num, c in enumerate(config['app']['considering_candles']):
-                required_candles.inject_required_candles_to_store(
-                    self.testing_initial_candles[num],
-                    c[0],
-                    c[1]
-                )
-
-            # run backtest simulation
-            simulator(self.testing_candles, hp)
-
-            # log for debugging/monitoring
-            if store.completed_trades.count > 0:
-                testing_data = stats.trades(store.completed_trades.trades, store.app.daily_balance)
-
-        else:
-            score = 0.0001
+        except Exception as e:
+            logger.error("".join(traceback.TracebackException.from_exception(e).format()))
 
         # reset store
         store.reset()
+        tune.report(score=score)
 
-        return score, training_data, testing_data
+
+    def get_search_space(self):
+        config = {}
+        for st_hp in self.strategy_hp:
+            if st_hp['type'] is int:
+                if 'step' not in st_hp:
+                    st_hp['step'] = 1
+                config[st_hp['name']] = tune.choice(range(st_hp['min'], st_hp['max'] + st_hp['step'], st_hp['step']))
+            elif st_hp['type'] is float:
+                if 'step' not in st_hp:
+                    st_hp['step'] = 0.1
+                decs = str(st_hp['step'])[::-1].find('.')
+                config[st_hp['name']] = tune.choice(np.trunc(np.arange(st_hp['min'], st_hp['max'] + st_hp['step'], st_hp['step']) * 10 ** decs) / (10 ** decs))
+            elif st_hp['type'] is bool:
+                config[st_hp['name']] = tune.choice([True, False])
+            else:
+                raise TypeError('Only int, bool and float types are implemented')
+        return config
+
+    def run(self):
+
+        ray.init(num_cpus=self.cpu_cores)
+
+        search_space = self.get_search_space()
+
+        sampler = NSGAIISampler(population_size=300, mutation_prob=0.0333, crossover_prob=0.6, swapping_prob=0.05)
+
+        optuna_search = OptunaSearch(
+            search_space,
+            sampler=sampler,
+            metric="score",
+            mode="max")
+
+        analysis = tune.run(
+            self.objective_function,
+            search_alg=optuna_search,
+            num_samples=self.iterations
+        )
+
+        print(f"Best config: {analysis.best_config}")
 
 
-def optimize_mode(start_date: str, finish_date: str, optimal_total: int, cpu_cores: int) -> None:
+def optimize_mode_ray(start_date: str, finish_date: str, optimal_total: int, cpu_cores: int,
+                              iterations: int) -> None:
     # clear the screen
     click.clear()
-    print('loading candles...')
 
     # validate routes
     validate_routes(router)
 
-    # load historical candles and divide them into training
-    # and testing candles (15% for test, 85% for training)
-    training_candles, testing_candles = get_training_and_testing_candles(start_date, finish_date)
+    training_candles = get_training_candles(start_date, finish_date)
 
-    # clear the screen
-    click.clear()
+    optimizer = Optimizer(training_candles, optimal_total, cpu_cores, iterations)
 
-    optimizer = Optimizer(training_candles, testing_candles, optimal_total, cpu_cores, start_date, finish_date)
+    print('Starting optimization...')
 
     optimizer.run()
 
-    # TODO: store hyper parameters into each strategies folder per each Exchange-symbol-timeframe
 
 
-def get_training_and_testing_candles(start_date_str: str, finish_date_str: str) -> Tuple[
-    Dict[str, Dict[str, Union[Union[str, ndarray], Any]]], Dict[str, Dict[str, Union[Union[str, ndarray], Any]]]]:
-    start_date = jh.arrow_to_timestamp(arrow.get(start_date_str, 'YYYY-MM-DD'))
-    finish_date = jh.arrow_to_timestamp(arrow.get(finish_date_str, 'YYYY-MM-DD')) - 60000
-
+def get_training_candles(start_date_str: str, finish_date_str: str):
     # Load candles (first try cache, then database)
-    candles = load_candles(start_date_str, finish_date_str)
+    from jesse.modes.backtest_mode import load_candles
+    return load_candles(start_date_str, finish_date_str)
 
-    # divide into training(85%) and testing(15%) sets
-    training_candles = {}
-    testing_candles = {}
-    days_diff = jh.date_diff_in_days(jh.timestamp_to_arrow(start_date), jh.timestamp_to_arrow(finish_date))
-    divider_index = int(days_diff * 0.85) * 1440
-    for key in candles:
-        training_candles[key] = {
-            'exchange': candles[key]['exchange'],
-            'symbol': candles[key]['symbol'],
-            'candles': candles[key]['candles'][0:divider_index],
-        }
-
-        testing_candles[key] = {
-            'exchange': candles[key]['exchange'],
-            'symbol': candles[key]['symbol'],
-            'candles': candles[key]['candles'][divider_index:],
-        }
-
-    return training_candles, testing_candles
